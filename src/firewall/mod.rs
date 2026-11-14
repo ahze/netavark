@@ -11,6 +11,8 @@ pub mod firewalld;
 pub mod fwnone;
 #[cfg(target_os = "linux")]
 pub mod nft;
+#[cfg(target_os = "freebsd")]
+pub mod pf;
 pub mod state;
 
 /// Max length of the network hash used in firewall object names.
@@ -19,6 +21,7 @@ pub const MAX_HASH_SIZE: usize = 13;
 const FIREWALLD: &str = "firewalld";
 const NFTABLES: &str = "nftables";
 const NONE: &str = "none";
+pub(crate) const PF: &str = "pf";
 
 /// Firewall drivers have the ability to set up per-network firewall forwarding
 /// and port mappings.
@@ -51,6 +54,8 @@ enum FirewallImpl {
     Firewalld(Connection),
     #[cfg(target_os = "linux")]
     Nftables,
+    #[cfg(target_os = "freebsd")]
+    Pf,
     Fwnone,
 }
 
@@ -79,6 +84,14 @@ fn get_firewall_impl(driver_name: Option<String>) -> NetavarkResult<FirewallImpl
             FIREWALLD | NFTABLES => {
                 return Err(NetavarkError::Message(format!(
                     "firewall driver {driver} is only supported on Linux"
+                )))
+            }
+            #[cfg(target_os = "freebsd")]
+            PF => return Ok(FirewallImpl::Pf),
+            #[cfg(not(target_os = "freebsd"))]
+            PF => {
+                return Err(NetavarkError::Message(format!(
+                    "firewall driver {driver} is only supported on FreeBSD"
                 )))
             }
             NONE => return Ok(FirewallImpl::Fwnone),
@@ -114,6 +127,11 @@ fn get_default_fw_impl() -> NetavarkResult<FirewallImpl> {
     Ok(FirewallImpl::Nftables)
 }
 
+#[cfg(default_fw = "pf")]
+fn get_default_fw_impl() -> NetavarkResult<FirewallImpl> {
+    Ok(FirewallImpl::Pf)
+}
+
 #[cfg(default_fw = "none")]
 fn get_default_fw_impl() -> NetavarkResult<FirewallImpl> {
     Ok(FirewallImpl::Fwnone)
@@ -135,6 +153,11 @@ pub fn get_supported_firewall_driver(
             FirewallImpl::Nftables => {
                 info!("Using nftables firewall driver");
                 nft::new()
+            }
+            #[cfg(target_os = "freebsd")]
+            FirewallImpl::Pf => {
+                info!("Using pf firewall driver");
+                pf::new()
             }
             FirewallImpl::Fwnone => {
                 info!("Not using firewall");
