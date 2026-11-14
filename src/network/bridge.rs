@@ -6,6 +6,8 @@ use std::{
 
 use crate::dns::aardvark::SafeString;
 use crate::network::core_utils::get_default_route_interface;
+#[cfg(target_os = "linux")]
+use crate::network::core_utils::is_using_systemd;
 use crate::network::dhcp::{dhcp_teardown, get_dhcp_lease};
 use crate::network::netlink::Socket;
 #[cfg(target_os = "linux")]
@@ -44,7 +46,7 @@ use super::{
         OPTION_MODE, OPTION_MTU, OPTION_NO_DEFAULT_ROUTE, OPTION_OUTBOUND_ADDR4,
         OPTION_OUTBOUND_ADDR6, OPTION_VLAN, OPTION_VRF, VALID_BRIDGE_OPTS,
     },
-    core_utils::{self, get_ipam_addresses, is_using_systemd, parse_option, CoreUtils},
+    core_utils::{self, get_ipam_addresses, parse_option, CoreUtils},
     driver::{self, DriverInfo},
     internal_types::{
         IPAMAddresses, IsolateOption, PortForwardConfig, SetupNetwork, TearDownNetwork,
@@ -478,11 +480,19 @@ impl<'a> Bridge<'a> {
         {
             Ok(br) => {
                 bridge_index = Some(br.header.index);
-                match host
+                #[cfg(target_os = "linux")]
+                let empty = host
                     .dump_links(&mut vec![LinkAttribute::Controller(br.header.index)])
                     .wrap("failed to get connected bridge interfaces")
-                {
-                    Ok(links) => links.is_empty() && matches!(mode, BridgeMode::Managed),
+                    .map(|links| links.is_empty());
+                #[cfg(not(target_os = "linux"))]
+                let empty = wrap!(
+                    crate::network::freebsd::bridge_members(&bridge_name),
+                    "failed to get connected bridge interfaces"
+                )
+                .map(|members| members.is_empty());
+                match empty {
+                    Ok(empty) => empty && matches!(mode, BridgeMode::Managed),
                     Err(err) => {
                         error_list.push(err);
                         false
@@ -733,7 +743,9 @@ impl<'a> Bridge<'a> {
 }
 
 // sysctl forward
+#[cfg(target_os = "linux")]
 const IPV4_FORWARD: &str = "net/ipv4/ip_forward";
+#[cfg(target_os = "linux")]
 const IPV6_FORWARD: &str = "net/ipv6/conf/all/forwarding";
 
 /// returns the container veth mac address
@@ -782,6 +794,7 @@ fn create_interfaces(
                 // https://issues.redhat.com/browse/RHEL-89477
                 // This writer is used to generate a matching sysctl.d config file for our values so
                 // systemd-sysctl is aware of them.
+                #[cfg(target_os = "linux")]
                 let path = if is_using_systemd() && !rootless {
                     let _ = fs::create_dir("/run/sysctl.d");
                     Some(sysctl::get_bridge_sysctl_d_path(
@@ -791,9 +804,11 @@ fn create_interfaces(
                     None
                 };
 
+                #[cfg(target_os = "linux")]
                 let mut sysctls = Vec::with_capacity(6);
 
                 // if internal block routing on the bridge otherwise enable routing globally
+                #[cfg(target_os = "linux")]
                 if internal {
                     sysctls.push((
                         format!("net/ipv4/conf/{}/forwarding", data.bridge_interface_name),
@@ -819,6 +834,7 @@ fn create_interfaces(
                     ));
                 }
 
+                #[cfg(target_os = "linux")]
                 if data.ipam.ipv6_enabled {
                     // Disable duplicate address detection if ipv6 enabled
                     // Do not accept Router Advertisements if ipv6 is enabled
@@ -835,9 +851,19 @@ fn create_interfaces(
                 // may be routed over a different interface on the reverse path.
                 // As documented for the sysctl for complicated or asymmetric routing loose mode (2)
                 // is recommended.
+                #[cfg(target_os = "linux")]
                 let br_rp_filter =
                     format!("net/ipv4/conf/{}/rp_filter", data.bridge_interface_name);
+                #[cfg(target_os = "linux")]
                 sysctls.push((br_rp_filter, "2"));
+
+                // Only the Linux sysctl.d writer cares about rootless.
+                #[cfg(not(target_os = "linux"))]
+                let _ = rootless;
+                #[cfg(not(target_os = "linux"))]
+                let path: Option<String> = None;
+                #[cfg(not(target_os = "linux"))]
+                let sysctls = freebsd_bridge_sysctls(internal, data.ipam.ipv6_enabled);
 
                 // writer must be create before the bridge is created
                 let sw = sysctl::SysctlDWriter::new(path, sysctls);
@@ -1193,6 +1219,20 @@ fn create_veth_pair<'fd>(
     }
 
     Ok(mac)
+}
+
+/// Forwarding is global on FreeBSD, and an internal network is kept from
+/// routing by its firewall rules rather than a per-interface knob.
+#[cfg(not(target_os = "linux"))]
+fn freebsd_bridge_sysctls(internal: bool, ipv6: bool) -> Vec<(String, &'static str)> {
+    let mut sysctls = Vec::with_capacity(2);
+    if !internal {
+        sysctls.push(("net.inet.ip.forwarding".to_string(), "1"));
+        if ipv6 {
+            sysctls.push(("net.inet6.ip6.forwarding".to_string(), "1"));
+        }
+    }
+    sysctls
 }
 
 /// Make sure the LinkMessage is of type bridge and if vlan is set also checks

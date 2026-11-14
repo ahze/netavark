@@ -1,6 +1,8 @@
+#[cfg(target_os = "linux")]
+use std::{fs::OpenOptions, io::Read as _};
 use std::{
-    fs::{self, File, OpenOptions},
-    io::{ErrorKind, Read as _, Result, Write as _},
+    fs::{self, File},
+    io::{ErrorKind, Result, Write as _},
     path::Path,
 };
 
@@ -13,6 +15,7 @@ pub fn apply_sysctl_value(ns_value: impl AsRef<str>, val: impl AsRef<str>) -> Ne
 
 /// Set a sysctl value by value's namespace.
 /// ns_value is the path of the sysctl (using slashes not dots!) and without the "/proc/sys/" prefix.
+#[cfg(target_os = "linux")]
 fn _apply_sysctl_value(ns_value: impl AsRef<str>, val: impl AsRef<str>) -> Result<()> {
     const PREFIX: &str = "/proc/sys/";
     let ns_value = ns_value.as_ref();
@@ -33,6 +36,34 @@ fn _apply_sysctl_value(ns_value: impl AsRef<str>, val: impl AsRef<str>) -> Resul
 
     let mut f = OpenOptions::new().write(true).open(&path)?;
     f.write_all(val.as_bytes())
+}
+
+/// Set an integer sysctl by its dotted name.
+#[cfg(target_os = "freebsd")]
+fn _apply_sysctl_value(name: impl AsRef<str>, val: impl AsRef<str>) -> Result<()> {
+    use std::io::Error;
+
+    let name = name.as_ref();
+    let val = val.as_ref();
+    log::debug!("Setting sysctl value for {name} to {val}");
+
+    let value: libc::c_int = val
+        .parse()
+        .map_err(|e| Error::new(ErrorKind::InvalidInput, format!("sysctl {name}={val}: {e}")))?;
+    let cname = std::ffi::CString::new(name)?;
+    let res = unsafe {
+        libc::sysctlbyname(
+            cname.as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &value as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>(),
+        )
+    };
+    if res < 0 {
+        return Err(Error::last_os_error());
+    }
+    Ok(())
 }
 
 pub fn disable_ipv6_autoconf(if_name: &str) -> NetavarkResult<()> {

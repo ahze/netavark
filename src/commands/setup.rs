@@ -63,9 +63,17 @@ impl Setup {
         // setup loopback, it should be safe to assume that 1 is the loopback index
         #[cfg(target_os = "linux")]
         netns.netlink.set_up(LinkID::ID(1))?;
-        // FreeBSD interface indexes are global across vnets, so go by name.
+        // FreeBSD interface indexes are global across vnets, so go by name,
+        // and a new vnet's lo0 has no addresses yet.
         #[cfg(not(target_os = "linux"))]
-        netns.netlink.set_up(LinkID::Name("lo0".to_string()))?;
+        {
+            let lo = netns.netlink.get_link(LinkID::Name("lo0".to_string()))?;
+            for addr in ["127.0.0.1/8", "::1/128"] {
+                let addr: ipnet::IpNet = addr.parse().expect("loopback address");
+                netns.netlink.add_addr(lo.header.index, &addr)?;
+            }
+            netns.netlink.set_up(LinkID::ID(lo.header.index))?;
+        }
 
         let config_dir = get_config_dir(config_dir, "setup")?;
         let mut drivers = Vec::with_capacity(network_options.network_info.len());
