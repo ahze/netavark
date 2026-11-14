@@ -26,11 +26,13 @@ const fn ioc(inout: libc::c_ulong, num: libc::c_ulong, len: usize) -> libc::c_ul
 const SIOCSIFNAME: libc::c_ulong = ioc(IOC_IN, 40, mem::size_of::<libc::ifreq>());
 const SIOCSIFVNET: libc::c_ulong = ioc(IOC_IN | IOC_OUT, 90, mem::size_of::<libc::ifreq>());
 const SIOCIFDESTROY: libc::c_ulong = ioc(IOC_IN, 121, mem::size_of::<libc::ifreq>());
+const SIOCGDRVSPEC: libc::c_ulong = ioc(IOC_IN | IOC_OUT, 123, mem::size_of::<libc::ifdrv>());
 const SIOCSDRVSPEC: libc::c_ulong = ioc(IOC_IN, 123, mem::size_of::<libc::ifdrv>());
 const SIOCIFCREATE2: libc::c_ulong = ioc(IOC_IN | IOC_OUT, 124, mem::size_of::<libc::ifreq>());
 
 // <net/if_bridgevar.h>
 const BRDGADD: libc::c_ulong = 0;
+const BRDGGIFS: libc::c_ulong = 6;
 
 /// `struct ifbreq`. BRDGADD reads only the member name; the rest of the
 /// 80 bytes are STP and port fields the kernel fills on get requests,
@@ -39,6 +41,43 @@ const BRDGADD: libc::c_ulong = 0;
 struct ifbreq {
     ifbr_ifsname: [libc::c_char; IFNAMSIZ],
     rest: [u32; 16],
+}
+
+/// `struct ifbifconf`: the member list buffer for BRDGGIFS.
+#[repr(C)]
+struct ifbifconf {
+    ifbic_len: u32,
+    ifbic_buf: *mut ifbreq,
+}
+
+/// The names of a bridge's member interfaces.
+pub fn bridge_members(bridge: &str) -> io::Result<Vec<String>> {
+    let mut drv: libc::ifdrv = unsafe { mem::zeroed() };
+    set_name(&mut drv.ifd_name, bridge)?;
+    drv.ifd_cmd = BRDGGIFS;
+    drv.ifd_len = mem::size_of::<ifbifconf>();
+    // First call with no buffer: the kernel reports the size it needs.
+    let mut conf = ifbifconf {
+        ifbic_len: 0,
+        ifbic_buf: std::ptr::null_mut(),
+    };
+    drv.ifd_data = &mut conf as *mut _ as *mut libc::c_void;
+    ioctl(SIOCGDRVSPEC, &mut drv as *mut _ as *mut libc::c_void)?;
+    let count = conf.ifbic_len as usize / mem::size_of::<ifbreq>();
+    let mut reqs: Vec<ifbreq> = (0..count)
+        .map(|_| ifbreq {
+            ifbr_ifsname: [0; IFNAMSIZ],
+            rest: [0; 16],
+        })
+        .collect();
+    conf.ifbic_buf = reqs.as_mut_ptr();
+    ioctl(SIOCGDRVSPEC, &mut drv as *mut _ as *mut libc::c_void)?;
+    let count = conf.ifbic_len as usize / mem::size_of::<ifbreq>();
+    Ok(reqs
+        .iter()
+        .take(count)
+        .map(|r| name_from(&r.ifbr_ifsname))
+        .collect())
 }
 
 /// Create an interface from cloner `kind` ("bridge", "epair") and return
@@ -146,6 +185,7 @@ mod tests {
         assert_eq!(SIOCSIFNAME, 0x8020_6928);
         assert_eq!(SIOCSIFVNET, 0xc020_695a);
         assert_eq!(SIOCSDRVSPEC, 0x8028_697b);
+        assert_eq!(SIOCGDRVSPEC, 0xc028_697b);
         assert_eq!(SIOCIFCREATE2, 0xc020_697c);
         assert_eq!(SIOCIFDESTROY, 0x8020_6979);
         assert_eq!(mem::size_of::<ifbreq>(), 80);

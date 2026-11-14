@@ -180,18 +180,31 @@ impl Socket<NetlinkRoute> {
 
     /// Modify a link. Linux has RTM_SETLINK for that; FreeBSD only handles
     /// RTM_NEWLINK, which modifies unless NLM_F_CREATE is set.
+    #[cfg(target_os = "linux")]
     fn set_link(
         &mut self,
         msg: LinkMessage,
         flags: u16,
     ) -> NetavarkResult<Vec<RouteNetlinkMessage>> {
-        #[cfg(target_os = "linux")]
-        return self.make_netlink_request(RouteNetlinkMessage::SetLink(msg), flags);
-        #[cfg(not(target_os = "linux"))]
-        return self.make_netlink_request(
+        self.make_netlink_request(RouteNetlinkMessage::SetLink(msg), flags)
+    }
+
+    /// FreeBSD also reads an empty change mask as "apply every flag", which
+    /// would take the interface down on an MTU or MAC change, so a message
+    /// that does not touch flags names one we never change.
+    #[cfg(not(target_os = "linux"))]
+    fn set_link(
+        &mut self,
+        mut msg: LinkMessage,
+        flags: u16,
+    ) -> NetavarkResult<Vec<RouteNetlinkMessage>> {
+        if msg.header.change_mask.is_empty() {
+            msg.header.change_mask = LinkFlags::Debug;
+        }
+        self.make_netlink_request(
             RouteNetlinkMessage::NewLink(msg),
             flags & !(NLM_F_CREATE | NLM_F_EXCL),
-        );
+        )
     }
 
     pub fn set_link_name(&mut self, id: u32, name: String) -> NetavarkResult<()> {
@@ -206,6 +219,13 @@ impl Socket<NetlinkRoute> {
 
     pub fn del_link(&mut self, id: LinkID) -> NetavarkResult<()> {
         let mut msg = LinkMessage::default();
+
+        // FreeBSD's RTM_DELLINK goes by index only.
+        #[cfg(not(target_os = "linux"))]
+        let id = match id {
+            LinkID::Name(name) => LinkID::ID(self.get_link(LinkID::Name(name))?.header.index),
+            id => id,
+        };
 
         match id {
             LinkID::ID(id) => msg.header.index = id,

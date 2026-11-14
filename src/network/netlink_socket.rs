@@ -123,7 +123,54 @@ mod freebsd {
                     flags,
                 )
             };
-            check_len(res)
+            let len = check_len(res)?;
+            hide_freebsd_link_attr(&mut buf[..len]);
+            Ok(len)
+        }
+    }
+
+    const RTM_NEWLINK: u16 = 16;
+    const NLMSG_HDRLEN: usize = 16;
+    const IFINFOMSG_LEN: usize = 16;
+    const NLA_HDRLEN: usize = 4;
+    const NLA_TYPE_MASK: u16 = 0x3fff;
+    /// FreeBSD's IFLA_FREEBSD, a nested attribute with the interface's
+    /// original name, hardware address and capabilities.
+    const IFLA_FREEBSD: u16 = 64;
+    /// Linux has no attribute 0x3fff, so netlink-packet-route keeps it as
+    /// `LinkAttribute::Other`.
+    const IFLA_UNKNOWN: u16 = 0x3fff;
+
+    /// Every FreeBSD link dump carries IFLA_FREEBSD (64), which is Linux's
+    /// IFLA_GRO_IPV4_MAX_SIZE, a u32, so netlink-packet-route refuses the
+    /// whole message. Retype it to an unknown attribute until the crate
+    /// knows FreeBSD's link attributes.
+    fn hide_freebsd_link_attr(buf: &mut [u8]) {
+        let u16_at = |b: &[u8], i: usize| u16::from_ne_bytes([b[i], b[i + 1]]);
+        let u32_at = |b: &[u8], i: usize| u32::from_ne_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
+        let mut off = 0;
+        while off + NLMSG_HDRLEN <= buf.len() {
+            let msg_len = u32_at(buf, off) as usize;
+            if msg_len < NLMSG_HDRLEN || off + msg_len > buf.len() {
+                return;
+            }
+            if u16_at(buf, off + 4) == RTM_NEWLINK {
+                let mut attr = off + NLMSG_HDRLEN + IFINFOMSG_LEN;
+                let end = off + msg_len;
+                while attr + NLA_HDRLEN <= end {
+                    let nla_len = u16_at(buf, attr) as usize;
+                    if nla_len < NLA_HDRLEN || attr + nla_len > end {
+                        break;
+                    }
+                    let nla_type = u16_at(buf, attr + 2);
+                    if nla_type & NLA_TYPE_MASK == IFLA_FREEBSD {
+                        let retyped = (nla_type & !NLA_TYPE_MASK) | IFLA_UNKNOWN;
+                        buf[attr + 2..attr + 4].copy_from_slice(&retyped.to_ne_bytes());
+                    }
+                    attr += (nla_len + 3) & !3;
+                }
+            }
+            off += (msg_len + 3) & !3;
         }
     }
 
