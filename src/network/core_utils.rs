@@ -468,8 +468,16 @@ pub fn add_default_routes(
                 }
             }
         };
-        sock.add_route(&route)
-            .wrap(format!("add default route {}", route))?;
+        match sock.add_route(&route) {
+            Ok(()) => {}
+            // Linux keeps one default route per gateway; a FreeBSD FIB holds
+            // one, so a container on several networks keeps the first.
+            #[cfg(target_os = "freebsd")]
+            Err(NetavarkError::Netlink(ref e)) if -e.raw_code() == libc::EEXIST => {
+                log::warn!("default route already exists, not adding {route}");
+            }
+            Err(e) => return Err(e).wrap(format!("add default route {}", route)),
+        }
     }
     Ok(())
 }
