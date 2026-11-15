@@ -340,6 +340,18 @@ impl Socket<NetlinkRoute> {
             }
             ipnet::IpNet::V6(_) => {
                 msg.header.family = AddressFamily::Inet6;
+                // FreeBSD takes the lifetimes from IFA_CACHEINFO and uses 0
+                // without it, which makes the address deprecated and expire
+                // at once. Linux defaults to forever.
+                #[cfg(target_os = "freebsd")]
+                {
+                    let mut forever = netlink_packet_route::address::CacheInfo::default();
+                    forever.ifa_preferred = u32::MAX;
+                    forever.ifa_valid = u32::MAX;
+                    msg.attributes.push(
+                        netlink_packet_route::address::AddressAttribute::CacheInfo(forever),
+                    );
+                }
             }
         };
 
