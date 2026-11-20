@@ -1174,9 +1174,9 @@ dependencies = [
 
 [[package]]
 name = "mozim"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "078aec06f40dd603e750d96b20f9bf90a34547ea472d738ca2819a3880faa783"
+checksum = "60d419110b51b70f2bb1927a481f0d9ee9ac7bda71c41ad47ea763c28232e4bf"
 dependencies = [
  "etherparse",
  "futures",
@@ -1197,7 +1197,6 @@ checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 name = "netavark"
 version = "2.1.0"
 dependencies = [
- "anyhow",
  "base16ct",
  "chrono",
  "clap",
@@ -1242,9 +1241,9 @@ checksum = "2d6e2daf9a8c2e21302714706860a0e6be02e03d17294ecc66b354ea7d4059dd"
 
 [[package]]
 name = "netlink-packet-route"
-version = "0.33.0"
+version = "0.34.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "59d48ffc8b73a506e1ff0878528c72668f2bfbc3d875b6be890a96be5d0d5576"
+checksum = "d3c407d8e95c0128ee5729728482a369f3ba9a0d9ba8335c20949a8d8989cf6b"
 dependencies = [
  "bitflags 2.13.1",
  "libc",
