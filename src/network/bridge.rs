@@ -1109,6 +1109,14 @@ fn create_veth_pair<'fd>(
     Ok(mac)
 }
 
+/// A random unicast, locally administered MAC, as Linux gives a new veth.
+#[cfg(not(target_os = "linux"))]
+fn random_mac() -> Vec<u8> {
+    let mut mac: [u8; 6] = rand::random();
+    mac[0] = (mac[0] & 0xfe) | 0x02;
+    mac.to_vec()
+}
+
 /// FreeBSD: an epair. Its "a" end joins the bridge, its "b" end is moved
 /// into the jail and renamed there. Returns the container side's mac.
 #[cfg(not(target_os = "linux"))]
@@ -1144,10 +1152,24 @@ fn create_veth_pair<'fd>(
             host.set_mtu(LinkID::Name(b.clone()), mtu)
                 .wrap("set container epair mtu")?;
         }
-        if let Some(mac) = &data.mac_address {
-            host.set_mac_address(LinkID::Name(b.clone()), mac.clone())
-                .wrap("set container epair mac")?;
-        }
+        // FreeBSD derives an epair's MAC from the host id and the
+        // interface name, and names are reused, so every container that
+        // gets epairNb would get the same MAC. Linux gives each veth a
+        // random one; do the same unless a static MAC was asked for.
+        // FreeBSD also accepts an all-zero or multicast MAC, which the
+        // Linux kernel refuses with EADDRNOTAVAIL; refuse it the same way.
+        let mac = match &data.mac_address {
+            Some(mac) if mac.iter().all(|b| *b == 0) || mac.first().is_some_and(|b| b & 1 == 1) => {
+                return Err(NetavarkError::msg(format!(
+                    "set container epair mac {}: Cannot assign requested address",
+                    CoreUtils::encode_address_to_hex(mac)
+                )));
+            }
+            Some(mac) => mac.clone(),
+            None => random_mac(),
+        };
+        host.set_mac_address(LinkID::Name(b.clone()), mac)
+            .wrap("set container epair mac")?;
         wrap!(
             freebsd::move_to_jail(&b, netns_fd.jid()),
             format!("move {b} into the jail")
