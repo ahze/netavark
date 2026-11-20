@@ -340,6 +340,18 @@ impl Socket<NetlinkRoute> {
             }
             ipnet::IpNet::V6(_) => {
                 msg.header.family = AddressFamily::Inet6;
+                // FreeBSD takes the lifetimes from IFA_CACHEINFO and uses 0
+                // without it, which makes the address deprecated and expire
+                // at once. Linux defaults to forever.
+                #[cfg(target_os = "freebsd")]
+                {
+                    let mut forever = netlink_packet_route::address::CacheInfo::default();
+                    forever.ifa_preferred = u32::MAX;
+                    forever.ifa_valid = u32::MAX;
+                    msg.attributes.push(
+                        netlink_packet_route::address::AddressAttribute::CacheInfo(forever),
+                    );
+                }
             }
         };
 
@@ -435,6 +447,23 @@ impl Socket<NetlinkRoute> {
         if let Some(gw) = gateway {
             msg.attributes
                 .push(netlink_packet_route::route::RouteAttribute::Gateway(gw));
+            // FreeBSD batches gateway routes into its lookup tables every
+            // 50 ms unless they are static (NL_RTA_RTFLAGS, RTF_STATIC);
+            // without the flag the container's default route is unusable
+            // for that long and its first packet fails with "Network is
+            // unreachable".
+            #[cfg(target_os = "freebsd")]
+            {
+                const NL_RTA_RTFLAGS: u16 = 14;
+                const RTF_STATIC: u32 = 0x800;
+                msg.attributes
+                    .push(netlink_packet_route::route::RouteAttribute::Other(
+                        netlink_packet_core::DefaultNla::new(
+                            NL_RTA_RTFLAGS,
+                            RTF_STATIC.to_ne_bytes().to_vec(),
+                        ),
+                    ));
+            }
         }
 
         msg.attributes
