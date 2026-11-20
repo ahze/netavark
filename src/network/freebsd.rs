@@ -80,12 +80,38 @@ pub fn bridge_members(bridge: &str) -> io::Result<Vec<String>> {
         .collect())
 }
 
+extern "C" {
+    // <sys/linker.h>; not in the libc crate.
+    fn kldload(file: *const libc::c_char) -> libc::c_int;
+}
+
 /// Create an interface from cloner `kind` ("bridge", "epair") and return
-/// the name the kernel gave it.
+/// the name the kernel gave it. The cloner's module is loaded first if the
+/// kernel does not know it yet, as ifconfig(8) does: a fresh host has no
+/// if_bridge or if_epair, and SIOCIFCREATE2 then fails with EINVAL.
 pub fn create_interface(kind: &str) -> io::Result<String> {
     let mut req = ifreq(kind)?;
-    ioctl(SIOCIFCREATE2, &mut req as *mut _ as *mut libc::c_void)?;
+    match ioctl(SIOCIFCREATE2, &mut req as *mut _ as *mut libc::c_void) {
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+            load_module(&format!("if_{kind}"))?;
+            req = ifreq(kind)?;
+            ioctl(SIOCIFCREATE2, &mut req as *mut _ as *mut libc::c_void)?;
+        }
+        res => res?,
+    }
     Ok(name_from(&req.ifr_name))
+}
+
+/// Load kernel module `name`; already loaded is success.
+fn load_module(name: &str) -> io::Result<()> {
+    let name = CString::new(name)?;
+    if unsafe { kldload(name.as_ptr()) } == -1 {
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EEXIST) {
+            return Err(err);
+        }
+    }
+    Ok(())
 }
 
 pub fn destroy_interface(name: &str) -> io::Result<()> {
