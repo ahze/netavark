@@ -44,10 +44,13 @@ To reach published ports through the host's own addresses, including `127.0.0.1`
 ```
 # sysctl net.pf.filter_local=1
 # echo net.pf.filter_local=1 >> /etc/sysctl.conf
+# sysrc -f /boot/loader.conf pf_load=YES
 ```
 
+The setting only takes effect when pf is enabled after it.
+At boot, `/etc/sysctl.conf` is applied before the pf module is loaded unless the loader loads it, which is what `pf_load=YES` does.
 If pf is already running, disable and enable it again after changing the setting (`pfctl -d; pfctl -e`).
-Without it, connections from the host to a published port on a local address time out.
+Without it, connections from the host to a published port on a local address time out, while connections from other hosts work.
 
 Netavark enables IP forwarding (`net.inet.ip.forwarding`, and `net.inet6.ip6.forwarding` for IPv6 networks) when it sets up a network.
 
