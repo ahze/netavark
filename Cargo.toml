@@ -6,7 +6,6 @@ authors = ["github.com/containers"]
 license = "Apache-2.0"
 readme = "README.md"
 description = "A container network stack"
-homepage = "https://github.com/containers/netavark"
 repository = "https://github.com/containers/netavark"
 categories = ["virtualization"]
 exclude = ["/.cirrus.yml", "/.github/*", "/hack/*"]
@@ -33,7 +32,6 @@ path = "src/test/main.rs"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [dependencies]
-anyhow = "1.0.93"
 clap = { version = "~4.6.6", features = ["derive", "env"] }
 env_logger = "0.11.11"
 ipnet = { version = "2.12.2", features = ["serde"] }
@@ -46,7 +44,7 @@ nix = { version = "0.31.3", features = ["net", "sched", "signal", "socket", "uio
 rand = "0.10.3"
 sha2 = "0.11.1"
 base16ct = "1.0.0"
-netlink-packet-route = "0.33.0"
+netlink-packet-route = "0.34.0"
 netlink-packet-core = "0.9.0"
 nftables = "0.6.3"
 fs2 = "0.4.3"
@@ -66,7 +64,7 @@ chrono = { version = "0.4.45", features = ["serde"] }
 
 # The DHCP proxy's client library needs Linux raw packet sockets.
 [target.'cfg(target_os = "linux")'.dependencies]
-mozim = { version = "0.3.3", default-features = false }
+mozim = { version = "0.3.4", default-features = false }
 # The libc crate has no FreeBSD netlink definitions; see network/netlink_socket.rs.
 netlink-sys = "0.9.0"
 
