@@ -693,10 +693,7 @@ impl<'a> Bridge<'a> {
                 self.info.container_id
             );
             if let Err(err) = crate::network::freebsd::destroy_interface(&member) {
-                if !matches!(
-                    err.raw_os_error(),
-                    Some(libc::ENXIO) | Some(libc::ENOENT)
-                ) {
+                if !matches!(err.raw_os_error(), Some(libc::ENXIO) | Some(libc::ENOENT)) {
                     error_list.push(NetavarkError::wrap(
                         format!("destroy orphaned host epair {member}"),
                         err.into(),
@@ -840,6 +837,7 @@ const IPV4_FORWARD: &str = "net/ipv4/ip_forward";
 const IPV6_FORWARD: &str = "net/ipv6/conf/all/forwarding";
 
 /// returns the container veth mac address
+#[allow(clippy::too_many_arguments)]
 fn create_interfaces(
     host: &mut Socket<NetlinkRoute>,
     netns: &mut Socket<NetlinkRoute>,
