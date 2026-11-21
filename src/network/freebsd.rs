@@ -24,6 +24,8 @@ const fn ioc(inout: libc::c_ulong, num: libc::c_ulong, len: usize) -> libc::c_ul
 
 // <sys/sockio.h>
 const SIOCSIFNAME: libc::c_ulong = ioc(IOC_IN, 40, mem::size_of::<libc::ifreq>());
+const SIOCSIFDESCR: libc::c_ulong = ioc(IOC_IN, 41, mem::size_of::<libc::ifreq>());
+const SIOCGIFDESCR: libc::c_ulong = ioc(IOC_IN | IOC_OUT, 42, mem::size_of::<libc::ifreq>());
 const SIOCSIFVNET: libc::c_ulong = ioc(IOC_IN | IOC_OUT, 90, mem::size_of::<libc::ifreq>());
 const SIOCIFDESTROY: libc::c_ulong = ioc(IOC_IN, 121, mem::size_of::<libc::ifreq>());
 const SIOCGDRVSPEC: libc::c_ulong = ioc(IOC_IN | IOC_OUT, 123, mem::size_of::<libc::ifdrv>());
@@ -127,6 +129,50 @@ pub fn rename_interface(name: &str, new_name: &str) -> io::Result<()> {
     ioctl(SIOCSIFNAME, &mut req as *mut _ as *mut libc::c_void)
 }
 
+/// Set the interface description (`ifconfig <name> description <descr>`).
+pub fn set_description(name: &str, descr: &str) -> io::Result<()> {
+    let descr = CString::new(descr)?;
+    let bytes = descr.as_bytes_with_nul();
+    let mut req = ifreq(name)?;
+    req.ifr_ifru.ifru_buffer = libc::ifreq_buffer {
+        length: bytes.len(),
+        buffer: bytes.as_ptr() as *mut libc::c_void,
+    };
+    ioctl(SIOCSIFDESCR, &mut req as *mut _ as *mut libc::c_void)
+}
+
+/// Read the interface description, returning an empty string when unset.
+pub fn interface_description(name: &str) -> io::Result<String> {
+    let mut buf = vec![0u8; 256];
+    let mut req = ifreq(name)?;
+    req.ifr_ifru.ifru_buffer = libc::ifreq_buffer {
+        length: buf.len(),
+        buffer: buf.as_mut_ptr() as *mut libc::c_void,
+    };
+    if let Err(err) = ioctl(SIOCGIFDESCR, &mut req as *mut _ as *mut libc::c_void) {
+        if err.raw_os_error() == Some(libc::ENAMETOOLONG) {
+            let needed = unsafe { req.ifr_ifru.ifru_buffer.length };
+            if needed > buf.len() {
+                buf.resize(needed, 0);
+                req = ifreq(name)?;
+                req.ifr_ifru.ifru_buffer = libc::ifreq_buffer {
+                    length: buf.len(),
+                    buffer: buf.as_mut_ptr() as *mut libc::c_void,
+                };
+                ioctl(SIOCGIFDESCR, &mut req as *mut _ as *mut libc::c_void)?;
+            } else {
+                return Err(err);
+            }
+        } else {
+            return Err(err);
+        }
+    }
+    let filled = unsafe { req.ifr_ifru.ifru_buffer.length }.min(buf.len());
+    let slice = &buf[..filled];
+    let nul_pos = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
+    Ok(String::from_utf8_lossy(&slice[..nul_pos]).into_owned())
+}
+
 /// Move an interface into the vnet of jail `jid`. Its addresses are gone
 /// afterwards; its MAC and MTU survive.
 pub fn move_to_jail(name: &str, jid: libc::c_int) -> io::Result<()> {
@@ -209,6 +255,8 @@ mod tests {
     #[test]
     fn ioctl_numbers_match_the_headers() {
         assert_eq!(SIOCSIFNAME, 0x8020_6928);
+        assert_eq!(SIOCSIFDESCR, 0x8020_6929);
+        assert_eq!(SIOCGIFDESCR, 0xc020_692a);
         assert_eq!(SIOCSIFVNET, 0xc020_695a);
         assert_eq!(SIOCSDRVSPEC, 0x8028_697b);
         assert_eq!(SIOCGDRVSPEC, 0xc028_697b);
