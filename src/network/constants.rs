@@ -38,7 +38,10 @@ pub const DEFAULT_METRIC: u32 = 100;
 pub const NO_CONTAINER_INTERFACE_ERROR: &str = "no container interface name given";
 
 /// make sure this is the same rootful default as used in podman.
+#[cfg(not(target_os = "freebsd"))]
 pub const DEFAULT_CONFIG_DIR: &str = "/run/containers/networks";
+#[cfg(target_os = "freebsd")]
+pub const DEFAULT_CONFIG_DIR: &str = "/var/run/containers/networks";
 
 pub const MAX_INTERFACE_NAME_LEN: usize = 15;
 
@@ -61,3 +64,16 @@ pub const VALID_VLAN_OPTS: &[&str] = &[
     OPTION_NO_DEFAULT_ROUTE,
     OPTION_BCLIM,
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::DEFAULT_CONFIG_DIR;
+
+    #[test]
+    fn test_default_config_dir() {
+        #[cfg(target_os = "freebsd")]
+        assert_eq!(DEFAULT_CONFIG_DIR, "/var/run/containers/networks");
+        #[cfg(not(target_os = "freebsd"))]
+        assert_eq!(DEFAULT_CONFIG_DIR, "/run/containers/networks");
+    }
+}
