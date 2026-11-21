@@ -54,6 +54,13 @@ Without it, connections from the host to a published port on a local address tim
 
 Netavark enables IP forwarding (`net.inet.ip.forwarding`, and `net.inet6.ip6.forwarding` for IPv6 networks) when it sets up a network.
 
+`aardvark-dns` binds port 53 on each network's gateway address.
+If a resolver on the host is bound to `*:53` (for example `dnsmasq` or `unbound`), `aardvark-dns` fails to bind (`Address already in use`) and podman reports `"aardvark-dns failed to start"`.
+Setting `dns_bind_port` under `[network]` in `containers.conf` moves `aardvark-dns` to that port and the `pf` driver redirects each network gateway's port 53 to it.
+Set `dns_bind_port` before starting containers; if it is changed while containers are running, stop `aardvark-dns` and restart the containers that use DNS.
+
+`aardvark-dns` 2.1.0 requires inotify (`vfs.inotify.max_user_instances` must be `0` or higher, default `256`).
+
 ### Rules
 
 Each network gets an anchor named after the network.
