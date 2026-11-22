@@ -140,6 +140,7 @@ impl Teardown {
                     dns_port,
                     config_dir: Path::new(&config_dir),
                     rootless,
+                    multi_network: false,
                 },
                 &plugin_directories,
             ) {

@@ -223,8 +223,11 @@ fn container_rules(
     Ok(rules)
 }
 
-/// Redirects for one address family of a container, plus the hairpin
-/// that lets the host and the subnet reach the published port.
+/// Redirects for one address family of a container, plus the NAT rule on
+/// the bridge so replies return through it: limited to loopback and the
+/// bridge's own subnet when this is the sole default route, or all
+/// sources when another network or `no_default_route` would send replies
+/// elsewhere.
 fn port_rules(
     rules: &mut String,
     ip: IpAddr,
@@ -236,6 +239,11 @@ fn port_rules(
     let bridge = bridge(&subnet).ok_or_else(|| {
         NetavarkError::msg(format!("no host interface has an address in {subnet}"))
     })?;
+    let nat_src = if setup_portfw.snat_all {
+        "any".to_string()
+    } else {
+        format!("{{ (lo0), {subnet} }}")
+    };
 
     for port in setup_portfw.port_mappings.iter().flatten() {
         let Some(host) = host_address(port, ip.is_ipv4())? else {
@@ -256,7 +264,7 @@ fn port_rules(
                 "rdr pass {family} proto {proto} from any to {host} port {host_ports} -> {ip} port {container_ports}\n"
             ));
             rules.push_str(&format!(
-                "nat on {bridge} {family} proto {proto} from {{ (lo0), {subnet} }} to {ip} port {} -> ({bridge})\n",
+                "nat on {bridge} {family} proto {proto} from {nat_src} to {ip} port {} -> ({bridge})\n",
                 port_range(port.container_port, port.range)
             ));
         }
@@ -527,6 +535,7 @@ mod tests {
             dns_port: 5353,
             dns_server_ips: &dns,
             internal: false,
+            snat_all: false,
         };
         let bridge = |_: &IpNet| Some("nvtest0".to_string());
         let rules = container_rules(&setup, &bridge).unwrap();
@@ -543,6 +552,43 @@ mod tests {
         assert_eq!(
             container_anchor("hash", "0123456789abcdef"),
             "netavark/hash-0123456789ab"
+        );
+    }
+
+    #[test]
+    fn container_port_rules_snat_all() {
+        let mappings = Some(vec![
+            mapping("", 18080, 8000, "tcp", 1),
+            mapping("", 2000, 3000, "udp", 11),
+        ]);
+        let dns = vec![];
+        let setup = PortForwardConfig {
+            container_id: "0123456789abcdef".into(),
+            network_id: "id".into(),
+            port_mappings: &mappings,
+            network_name: "nvtest".into(),
+            network_hash_name: "hash".into(),
+            container_ip_v4: Some("10.89.0.2".parse().unwrap()),
+            subnet_v4: Some("10.89.0.0/24".parse().unwrap()),
+            container_ip_v6: Some("fd00:89::2".parse().unwrap()),
+            subnet_v6: Some("fd00:89::/64".parse().unwrap()),
+            dns_port: 53,
+            dns_server_ips: &dns,
+            internal: false,
+            snat_all: true,
+        };
+        let bridge = |_: &IpNet| Some("nvtest0".to_string());
+        let rules = container_rules(&setup, &bridge).unwrap();
+        assert_eq!(
+            rules,
+            "rdr pass inet proto tcp from any to (self) port 18080 -> 10.89.0.2 port 8000\n\
+             nat on nvtest0 inet proto tcp from any to 10.89.0.2 port 8000 -> (nvtest0)\n\
+             rdr pass inet proto udp from any to (self) port 2000:2010 -> 10.89.0.2 port 3000:*\n\
+             nat on nvtest0 inet proto udp from any to 10.89.0.2 port 3000:3010 -> (nvtest0)\n\
+             rdr pass inet6 proto tcp from any to (self) port 18080 -> fd00:89::2 port 8000\n\
+             nat on nvtest0 inet6 proto tcp from any to fd00:89::2 port 8000 -> (nvtest0)\n\
+             rdr pass inet6 proto udp from any to (self) port 2000:2010 -> fd00:89::2 port 3000:*\n\
+             nat on nvtest0 inet6 proto udp from any to fd00:89::2 port 3000:3010 -> (nvtest0)\n"
         );
     }
 }

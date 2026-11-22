@@ -578,6 +578,7 @@ impl<'a> Bridge<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn get_firewall_conf(
         &'a self,
         container_addresses: &Vec<IpNet>,
@@ -586,6 +587,7 @@ impl<'a> Bridge<'a> {
         bridge_name: String,
         outbound_addr4: Option<Ipv4Addr>,
         outbound_addr6: Option<Ipv6Addr>,
+        snat_all: bool,
     ) -> NetavarkResult<(SetupNetwork, PortForwardConfig<'a>)> {
         let id_network_hash =
             CoreUtils::create_network_hash(&self.info.network.name, MAX_HASH_SIZE);
@@ -647,6 +649,7 @@ impl<'a> Bridge<'a> {
             dns_port: self.info.dns_port,
             dns_server_ips: nameservers,
             internal: self.info.network.internal,
+            snat_all,
         };
         Ok((sn, spf))
     }
@@ -711,6 +714,7 @@ impl<'a> Bridge<'a> {
             data.bridge_interface_name.clone(),
             data.outbound_addr4,
             data.outbound_addr6,
+            self.info.multi_network || data.no_default_route,
         )?;
 
         if !self.info.rootless {
@@ -798,6 +802,7 @@ impl<'a> Bridge<'a> {
             bridge_name,
             outbound_addr4,
             outbound_addr6,
+            false,
         )?;
 
         let tn = TearDownNetwork {

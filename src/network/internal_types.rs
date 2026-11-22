@@ -85,6 +85,15 @@ pub struct PortForwardConfigGeneric<Ports, IpAddresses> {
     // whether network is internal; skip container port forwarding rules
     #[serde(default)]
     pub internal: bool,
+    /// SNAT all forwarded connections to the bridge gateway so replies
+    /// return through this bridge when the container has other networks or
+    /// no default route on it.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub snat_all: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 // Some trickery to define two struct one with references and one with owned data,
@@ -110,6 +119,7 @@ impl<'a> From<&'a PortForwardConfigOwned> for PortForwardConfig<'a> {
             dns_port: p.dns_port,
             dns_server_ips: &p.dns_server_ips,
             internal: p.internal,
+            snat_all: p.snat_all,
         }
     }
 }

@@ -246,6 +246,52 @@ fn read_dir_conf<T: DeserializeOwned>(dir: PathBuf) -> NetavarkResult<Vec<T>> {
     Ok(confs)
 }
 
+/// Enable full bridge SNAT on an already-configured container's published
+/// ports, e.g. when a second network is attached via `network connect`.
+#[cfg(target_os = "freebsd")]
+pub fn enable_container_port_snat(
+    config_dir: &Path,
+    container_id: &str,
+    fw_driver: &dyn crate::firewall::FirewallDriver,
+) -> NetavarkResult<()> {
+    let paths = get_file_paths(config_dir, "", "", false)?;
+    let entries = match fs::read_dir(&paths.port_conf_file) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(NetavarkError::wrap(
+                format!("read dir {:?}", paths.port_conf_file.display()),
+                e.into(),
+            ));
+        }
+    };
+    for entry in entries {
+        let path = ignore_enoent!(entry, continue)?.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name
+            .split_once('_')
+            .is_none_or(|(_, cid)| cid != container_id)
+        {
+            continue;
+        }
+        let content = wrap!(
+            ignore_enoent!(fs::read_to_string(&path), continue),
+            format!("read config {:?}", path.display())
+        )?;
+        let mut conf: PortForwardConfigOwned = serde_json::from_str(&content)?;
+        if conf.snat_all {
+            continue;
+        }
+        conf.snat_all = true;
+        let f = fs_err!(File::create, &path, "update port config")?;
+        serde_json::to_writer(f, &conf)?;
+        fw_driver.setup_port_forward((&conf).into(), &None)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
@@ -293,6 +339,7 @@ mod tests {
             dns_port: 53,
             dns_server_ips: &vec![],
             internal: false,
+            snat_all: false,
         };
         let port_conf_json = r#"{"container_id":"123","network_id":"c2c8a073252874648259997d53b0a1bffa491e21f04bc1bf8609266359931395","port_mappings":null,"network_name":"name","network_hash_name":"hash","container_ip_v4":"10.0.0.2","subnet_v4":"10.0.0.0/24","container_ip_v6":null,"subnet_v6":null,"dns_port":53,"dns_server_ips":[],"internal":false}"#;
 
@@ -351,5 +398,44 @@ mod tests {
 
         let res = read_fw_config(config_dir).expect("no read_fw_config error");
         assert!(res.is_none(), "no firewall config should be given");
+    }
+
+    #[test]
+    fn test_fw_config_snat_all() {
+        let tmpdir = Builder::new().prefix("netavark-tests").tempdir().unwrap();
+        let config_dir = tmpdir.path();
+
+        let net_conf = SetupNetwork {
+            subnets: Some(vec!["10.0.0.0/24".parse().unwrap()]),
+            network_id: "net1".to_string(),
+            bridge_name: "podman1".to_string(),
+            network_hash_name: "hash".to_string(),
+            isolation: IsolateOption::Never,
+            dns_port: 53,
+            internal: false,
+            dns_enabled: false,
+            outbound_addr4: None,
+            outbound_addr6: None,
+        };
+        let port_conf = PortForwardConfig {
+            container_id: "cid1".to_string(),
+            network_id: "net1".to_string(),
+            port_mappings: &None,
+            network_name: "priv".to_string(),
+            network_hash_name: "hash".to_string(),
+            container_ip_v4: Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))),
+            subnet_v4: Some("10.0.0.0/24".parse().unwrap()),
+            container_ip_v6: None,
+            subnet_v6: None,
+            dns_port: 53,
+            dns_server_ips: &vec![],
+            internal: false,
+            snat_all: true,
+        };
+
+        write_fw_config(config_dir, "net1", "cid1", "pf", &net_conf, &port_conf).unwrap();
+        let res = read_fw_config(config_dir).unwrap().unwrap();
+        assert_eq!(res.port_confs.len(), 1);
+        assert!(res.port_confs[0].snat_all);
     }
 }

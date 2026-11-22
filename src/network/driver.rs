@@ -33,6 +33,7 @@ pub struct DriverInfo<'a> {
     pub config_dir: &'a Path,
     pub rootless: bool,
     pub container_hostname: &'a Option<String>,
+    pub multi_network: bool,
 }
 
 pub trait NetworkDriver {

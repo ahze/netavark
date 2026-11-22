@@ -66,7 +66,7 @@ Set `dns_bind_port` before starting containers; if it is changed while container
 Each network gets an anchor named after the network.
 It holds the outbound NAT on the interface of the host's default route, and the isolation rules when the network is internal or has the `isolate` option.
 Each container with published ports gets an anchor named after the network and the container ID.
-It holds `rdr pass` rules that redirect the host ports to the container, and a NAT rule on the bridge so that the container itself and the host's loopback can reach the published ports.
+It holds `rdr pass` rules that redirect the host ports to the container, and a NAT rule on the bridge so that the container itself and the host's loopback can reach the published ports (widened to all sources when the container has additional networks or `no_default_route`, so replies return through the bridge).
 When DNS is enabled, port 53 on the gateway is redirected to aardvark-dns.
 
 The `netavark-subnets` table lists the subnets of every Netavark network, and `netavark-isolated` those of networks with `isolate` set.

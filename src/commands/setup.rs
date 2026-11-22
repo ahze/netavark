@@ -76,6 +76,21 @@ impl Setup {
         }
 
         let config_dir = get_config_dir(config_dir, "setup")?;
+        let existing_ifaces = netns
+            .netlink
+            .dump_links(&mut Vec::new())
+            .map(|links| {
+                links
+                    .iter()
+                    .filter(|l| {
+                        !l.header
+                            .flags
+                            .contains(netlink_packet_route::link::LinkFlags::Loopback)
+                    })
+                    .count()
+            })
+            .unwrap_or(0);
+        let multi_network = existing_ifaces + network_options.networks.len() > 1;
         let mut drivers = Vec::with_capacity(network_options.network_info.len());
 
         for named_network_opts in &network_options.networks {
@@ -106,6 +121,7 @@ impl Setup {
                     dns_port,
                     config_dir: Path::new(&config_dir),
                     rootless,
+                    multi_network,
                 },
                 &plugin_directories,
             )?;
@@ -138,6 +154,18 @@ impl Setup {
             let _ = response.insert(driver.network_name(), status);
             if let Some(a) = aardvark_entry {
                 aardvark_entries.push(a);
+            }
+        }
+
+        #[cfg(target_os = "freebsd")]
+        if !rootless && existing_ifaces > 0 && multi_network {
+            if let Err(err) = firewall::state::enable_container_port_snat(
+                Path::new(&config_dir),
+                &network_options.container_id,
+                firewall_driver.as_ref(),
+            ) {
+                teardown_drivers(drivers.iter(), &mut hostns.netlink, &mut netns.netlink);
+                return Err(err);
             }
         }
 
