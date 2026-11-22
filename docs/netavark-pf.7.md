@@ -86,8 +86,9 @@ This is harmless.
 
 ### Reloading pf
 
-Reloading the ruleset (`service pf reload`, `pfctl -f /etc/pf.conf`) keeps the rules in the Netavark anchors and the entries in the tables.
-Flushing it (`service pf restart`, `pfctl -F all`) removes them, and running containers lose outbound NAT and their published ports until the rules are restored with:
+Reloading the ruleset (`service pf reload`, `pfctl -f /etc/pf.conf`) keeps the rules in the Netavark anchors and the entries in `<netavark-subnets>` and `<netavark-isolated>`.
+`service pf restart` runs `pfctl -F all` before reloading `/etc/pf.conf`: the rules inside the `netavark/*` sub-anchors stay in place, so outbound NAT and published ports keep working, but `<netavark-subnets>` and `<netavark-isolated>` are emptied, leaving network isolation and any filter rules that name `<netavark-subnets>` inactive (and a bare `pfctl -F all` without reloading `/etc/pf.conf` removes the anchor hooks in the main ruleset as well).
+Restore the tables and anchor rules of running containers with:
 
 ```
 # netavark firewall-reload
