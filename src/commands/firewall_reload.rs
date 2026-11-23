@@ -39,7 +39,7 @@ fn reload_rules_inner(config_dir: &Path, conn: &Option<Connection>) -> NetavarkR
     // If there are no config files, there are no running containers, so we do nothing.
     if let Some(conf) = conf {
         // Get the appropriate firewall driver
-        let fw_driver = get_supported_firewall_driver(Some(conf.driver))?;
+        let fw_driver = get_supported_firewall_driver(Some(conf.driver), config_dir)?;
 
         // Loop through each network configuration and restore its rules.
         for net in conf.net_confs {

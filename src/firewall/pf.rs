@@ -1,26 +1,26 @@
 //! pf firewall driver for FreeBSD.
 //!
 //! Rules live in anchors under `netavark/`, loaded with `pfctl -a <anchor>
-//! -f -` and flushed with `pfctl -a <anchor> -F rules` and `-F nat`. The host's pf.conf
-//! has to include them:
+//! -f -` and flushed with `pfctl -a <anchor> -F rules`, `-F nat`, and `-F Tables`.
+//! The host's pf.conf has to include them:
 //!
 //! ```text
-//! table <netavark-subnets> persist
-//! table <netavark-isolated> persist
 //! nat-anchor "netavark/*"
 //! rdr-anchor "netavark/*"
 //! anchor "netavark/*"
 //! ```
 //!
-//! One anchor per network holds its NAT and its isolation rules; one per
-//! network and container holds that container's port redirects and the
-//! loopback hairpin for them. The two tables list every netavark subnet
-//! and the subnets of isolated networks; a rule in an anchor that names a
-//! table falls back to the main ruleset's table of that name, which is
-//! why they are declared there.
+//! One anchor per network holds its outbound NAT, its isolation rules, and
+//! when isolated its own `<isolated>` table listing the peer subnets it may
+//! not reach; one anchor per network and container holds that container's
+//! port redirects and the bridge NAT rules for them. Because `<isolated>`
+//! is defined inside the network anchor rather than in the main ruleset,
+//! rules and isolation tables survive `service pf reload`, `service pf restart`,
+//! and `pfctl -F all && pfctl -f /etc/pf.conf`.
 
 use std::io::Write;
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use ipnet::IpNet;
@@ -38,15 +38,15 @@ use crate::network::types::PortMapping;
 use crate::wrap;
 
 const ANCHOR_PREFIX: &str = "netavark/";
-/// Every netavark subnet, for strict isolation.
-const SUBNETS_TABLE: &str = "netavark-subnets";
-/// The subnets of networks with isolate set, for normal isolation.
-const ISOLATED_TABLE: &str = "netavark-isolated";
+/// Anchor-local table listing the peer subnets that this network may not reach.
+const ISOLATED_TABLE: &str = "isolated";
 
-pub struct Pf {}
+pub struct Pf {
+    config_dir: PathBuf,
+}
 
-pub fn new() -> NetavarkResult<Box<dyn firewall::FirewallDriver>> {
-    Ok(Box::new(Pf {}))
+pub fn new(config_dir: PathBuf) -> NetavarkResult<Box<dyn firewall::FirewallDriver>> {
+    Ok(Box::new(Pf { config_dir }))
 }
 
 impl firewall::FirewallDriver for Pf {
@@ -59,27 +59,61 @@ impl firewall::FirewallDriver for Pf {
         network_setup: SetupNetwork,
         _dbus_conn: &Option<zbus::blocking::Connection>,
     ) -> NetavarkResult<()> {
-        for subnet in network_setup.subnets.iter().flatten() {
-            table_change(SUBNETS_TABLE, "add", subnet)?;
-            if isolated(&network_setup) {
-                table_change(ISOLATED_TABLE, "add", subnet)?;
+        let _lock = firewall::state::lock_pf(&self.config_dir)?;
+        let mut all_networks = firewall::state::read_network_configs(&self.config_dir)?;
+        all_networks.retain(|n| n.network_hash_name != network_setup.network_hash_name);
+        all_networks.push(network_setup);
+        let self_idx = all_networks.len() - 1;
+        let self_net = &all_networks[self_idx];
+
+        let mut to_load: Vec<&SetupNetwork> = Vec::with_capacity(all_networks.len());
+        to_load.push(self_net);
+        if has_subnets(self_net) {
+            for peer in &all_networks[..self_idx] {
+                if peer_needs_reload(peer, self_net) {
+                    to_load.push(peer);
+                }
             }
         }
-        let rules = if network_setup.subnets.is_some() {
-            network_rules(&network_setup, &egress_interface()?)
+
+        let egress = if to_load.iter().any(|n| !n.internal && has_subnets(n)) {
+            egress_interface()?
         } else {
             String::new()
         };
-        load_anchor(&network_anchor(&network_setup.network_hash_name), &rules)
+
+        for net in to_load {
+            let rules = network_rules(net, &all_networks, &egress);
+            load_anchor(&network_anchor(&net.network_hash_name), &rules)?;
+        }
+        Ok(())
     }
 
     fn teardown_network(&self, tear: TearDownNetwork) -> NetavarkResult<()> {
         if tear.complete_teardown {
+            let _lock = firewall::state::lock_pf(&self.config_dir)?;
+            let mut all_networks = firewall::state::read_network_configs(&self.config_dir)?;
+            // A concurrent setup for the same network may have re-created its
+            // network state file after remove_fw_config ran; leave the anchor alive.
+            if all_networks
+                .iter()
+                .any(|n| n.network_hash_name == tear.config.network_hash_name)
+            {
+                return Ok(());
+            }
             flush_anchor(&network_anchor(&tear.config.network_hash_name))?;
-            for subnet in tear.config.subnets.iter().flatten() {
-                table_change(SUBNETS_TABLE, "delete", subnet)?;
-                if isolated(&tear.config) {
-                    table_change(ISOLATED_TABLE, "delete", subnet)?;
+            if has_subnets(&tear.config) {
+                all_networks.retain(|n| n.network_hash_name != tear.config.network_hash_name);
+                let peers: Vec<&SetupNetwork> = all_networks
+                    .iter()
+                    .filter(|n| peer_needs_reload(n, &tear.config))
+                    .collect();
+                if !peers.is_empty() {
+                    let egress = egress_interface()?;
+                    for peer in peers {
+                        let rules = network_rules(peer, &all_networks, &egress);
+                        load_anchor(&network_anchor(&peer.network_hash_name), &rules)?;
+                    }
                 }
             }
         }
@@ -91,6 +125,7 @@ impl firewall::FirewallDriver for Pf {
         setup_portfw: PortForwardConfig,
         _dbus_conn: &Option<zbus::blocking::Connection>,
     ) -> NetavarkResult<()> {
+        let _lock = firewall::state::lock_pf(&self.config_dir)?;
         let rules = container_rules(&setup_portfw, &interface_for_subnet)?;
         load_anchor(
             &container_anchor(&setup_portfw.network_hash_name, &setup_portfw.container_id),
@@ -99,6 +134,7 @@ impl firewall::FirewallDriver for Pf {
     }
 
     fn teardown_port_forward(&self, tear: TeardownPortForward) -> NetavarkResult<()> {
+        let _lock = firewall::state::lock_pf(&self.config_dir)?;
         flush_anchor(&container_anchor(
             &tear.config.network_hash_name,
             &tear.config.container_id,
@@ -113,15 +149,74 @@ fn isolated(network_setup: &SetupNetwork) -> bool {
     )
 }
 
-/// The rules of a network. NAT hides each subnet behind `egress` unless
-/// the network is internal, which instead may only reach its own bridge
-/// (that is where aardvark-dns answers). Isolation keeps the subnet and
-/// the other netavark subnets apart, all of them for strict and the
-/// isolated ones for normal; the bridge's own subnet is always allowed
-/// because that is how containers reach the gateway.
-fn network_rules(network_setup: &SetupNetwork, egress: &str) -> String {
+fn has_subnets(network_setup: &SetupNetwork) -> bool {
+    network_setup
+        .subnets
+        .as_ref()
+        .is_some_and(|s| !s.is_empty())
+}
+
+/// Whether `peer`'s `<isolated>` table may include or drop `changed`'s subnets.
+fn peer_needs_reload(peer: &SetupNetwork, changed: &SetupNetwork) -> bool {
+    if peer.internal || !has_subnets(peer) {
+        return false;
+    }
+    match peer.isolation {
+        IsolateOption::Strict => true,
+        IsolateOption::Normal => isolated(changed),
+        IsolateOption::Never => false,
+    }
+}
+
+/// Peer subnets that `network_setup` must block in its `<isolated>` table:
+/// every other network's subnets under `strict`, or isolated peers under `normal`.
+fn isolated_peers(network_setup: &SetupNetwork, all_networks: &[SetupNetwork]) -> Vec<IpNet> {
+    let mut peers = Vec::new();
+    for other in all_networks {
+        if other.network_hash_name == network_setup.network_hash_name {
+            continue;
+        }
+        let include = match network_setup.isolation {
+            IsolateOption::Strict => true,
+            IsolateOption::Normal => isolated(other),
+            IsolateOption::Never => false,
+        };
+        if include {
+            peers.extend(other.subnets.iter().flatten().copied());
+        }
+    }
+    peers.sort();
+    peers.dedup();
+    peers
+}
+
+/// The rules of a network. When isolated, a `table <isolated>` definition
+/// comes first (required before translation and filter rules by pf syntax),
+/// followed by outbound NAT on `egress` (unless internal), and isolation
+/// rules on the bridge.
+fn network_rules(
+    network_setup: &SetupNetwork,
+    all_networks: &[SetupNetwork],
+    egress: &str,
+) -> String {
+    if !has_subnets(network_setup) {
+        return String::new();
+    }
     let mut rules = String::new();
     let bridge = &network_setup.bridge_name;
+    if !network_setup.internal && isolated(network_setup) {
+        let peers = isolated_peers(network_setup, all_networks);
+        if peers.is_empty() {
+            rules.push_str(&format!("table <{ISOLATED_TABLE}> {{ }}\n"));
+        } else {
+            let addrs = peers
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            rules.push_str(&format!("table <{ISOLATED_TABLE}> {{ {addrs} }}\n"));
+        }
+    }
     for subnet in network_setup.subnets.iter().flatten() {
         if network_setup.internal {
             continue;
@@ -160,37 +255,16 @@ fn network_rules(network_setup: &SetupNetwork, egress: &str) -> String {
             ));
             continue;
         }
-        let table = match network_setup.isolation {
-            IsolateOption::Strict => SUBNETS_TABLE,
-            IsolateOption::Normal => ISOLATED_TABLE,
-            IsolateOption::Never => continue,
-        };
+        if !isolated(network_setup) {
+            continue;
+        }
         rules.push_str(&format!(
             "pass in quick on {bridge} {family} from {subnet} to {subnet}\n\
              pass in quick on {bridge} {family} from {subnet} to (self)\n\
-             block in quick on {bridge} {family} from {subnet} to <{table}>\n"
+             block in quick on {bridge} {family} from {subnet} to <{ISOLATED_TABLE}>\n"
         ));
     }
     rules
-}
-
-fn table_change(table: &str, op: &str, subnet: &IpNet) -> NetavarkResult<()> {
-    debug!("pf table {table}: {op} {subnet}");
-    let out = wrap!(
-        Command::new("pfctl")
-            .args(["-q", "-t", table, "-T", op, &subnet.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output(),
-        "run pfctl"
-    )?;
-    if !out.status.success() {
-        return Err(NetavarkError::msg(format!(
-            "pfctl -t {table} -T {op} {subnet}: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    Ok(())
 }
 
 /// The rules of one container on one network: the DNS redirect when
@@ -394,17 +468,32 @@ fn anchor_exists(anchor: &str) -> bool {
     }
 }
 
+fn anchor_has_tables(anchor: &str) -> bool {
+    let out = Command::new("pfctl")
+        .args(["-q", "-a", anchor, "-s", "Tables"])
+        .stderr(Stdio::null())
+        .output();
+    match out {
+        Ok(out) if out.status.success() => !String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+        _ => false,
+    }
+}
+
 fn flush_anchor(anchor: &str) -> NetavarkResult<()> {
     if !anchor_exists(anchor) {
         debug!("pf anchor {anchor} does not exist, nothing to flush");
         return Ok(());
     }
     debug!("flushing pf anchor {anchor}");
-    // Only the anchor's own rule sets. `-F all` would also flush the
-    // global state table and fail on the parts an anchor does not have.
-    // An anchor whose rules named a host table stays listed, empty,
-    // after this; pf keeps the table reference and nothing clears it.
-    for what in ["rules", "nat"] {
+    // Only the anchor's own rule sets (and any anchor-local tables).
+    // `-F all` would also flush the global state table and fail on the
+    // parts an anchor does not have, while `-F Tables` errors when an
+    // anchor never defined a table.
+    let mut parts = vec!["rules", "nat"];
+    if anchor_has_tables(anchor) {
+        parts.push("Tables");
+    }
+    for what in parts {
         let out = wrap!(
             Command::new("pfctl")
                 .args(["-q", "-a", anchor, "-F", what])
@@ -427,6 +516,26 @@ fn flush_anchor(anchor: &str) -> NetavarkResult<()> {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    fn net(
+        name: &str,
+        subnets: Vec<&str>,
+        isolation: IsolateOption,
+        internal: bool,
+    ) -> SetupNetwork {
+        SetupNetwork {
+            subnets: Some(subnets.into_iter().map(|s| s.parse().unwrap()).collect()),
+            bridge_name: format!("br_{name}"),
+            network_id: format!("id_{name}"),
+            network_hash_name: format!("hash_{name}"),
+            isolation,
+            dns_port: 53,
+            internal,
+            dns_enabled: true,
+            outbound_addr4: None,
+            outbound_addr6: None,
+        }
+    }
 
     fn mapping(
         host_ip: &str,
@@ -462,7 +571,7 @@ mod tests {
             outbound_addr6: None,
         };
         assert_eq!(
-            network_rules(&setup, "re0"),
+            network_rules(&setup, std::slice::from_ref(&setup), "re0"),
             "nat on re0 inet from 10.89.0.0/24 to any -> (re0)\n\
              nat on re0 inet6 from fd00:89::/64 to !ff00::/8 -> (re0)\n"
         );
@@ -472,7 +581,7 @@ mod tests {
             ..setup
         };
         assert_eq!(
-            network_rules(&setup, "re0"),
+            network_rules(&setup, std::slice::from_ref(&setup), "re0"),
             "nat on re0 inet from 10.89.0.0/24 to any -> 192.168.86.5\n"
         );
     }
@@ -492,26 +601,91 @@ mod tests {
             outbound_addr6: None,
         };
         assert_eq!(
-            network_rules(&setup, "re0"),
-            "nat on re0 inet from 10.89.0.0/24 to any -> (re0)\n\
+            network_rules(&setup, std::slice::from_ref(&setup), "re0"),
+            "table <isolated> { }\n\
+             nat on re0 inet from 10.89.0.0/24 to any -> (re0)\n\
              pass in quick on nvtest0 inet from 10.89.0.0/24 to 10.89.0.0/24\n\
              pass in quick on nvtest0 inet from 10.89.0.0/24 to (self)\n\
-             block in quick on nvtest0 inet from 10.89.0.0/24 to <netavark-subnets>\n"
+             block in quick on nvtest0 inet from 10.89.0.0/24 to <isolated>\n"
         );
         let setup = SetupNetwork {
             isolation: IsolateOption::Normal,
             ..setup
         };
-        assert!(network_rules(&setup, "re0").contains("to <netavark-isolated>\n"));
+        assert_eq!(
+            network_rules(&setup, std::slice::from_ref(&setup), "re0"),
+            "table <isolated> { }\n\
+             nat on re0 inet from 10.89.0.0/24 to any -> (re0)\n\
+             pass in quick on nvtest0 inet from 10.89.0.0/24 to 10.89.0.0/24\n\
+             pass in quick on nvtest0 inet from 10.89.0.0/24 to (self)\n\
+             block in quick on nvtest0 inet from 10.89.0.0/24 to <isolated>\n"
+        );
         let setup = SetupNetwork {
             internal: true,
             ..setup
         };
         assert_eq!(
-            network_rules(&setup, "re0"),
+            network_rules(&setup, std::slice::from_ref(&setup), "re0"),
             "pass in quick on nvtest0 inet from 10.89.0.0/24 to (nvtest0)\n\
              block in quick on nvtest0 inet from 10.89.0.0/24 to any\n"
         );
+    }
+
+    #[test]
+    fn isolation_peer_tables() {
+        let all = vec![
+            net(
+                "strict_a",
+                vec!["10.89.1.0/24", "fd00:1::/64"],
+                IsolateOption::Strict,
+                false,
+            ),
+            net(
+                "strict_b",
+                vec!["10.89.2.0/24"],
+                IsolateOption::Strict,
+                false,
+            ),
+            net(
+                "normal",
+                vec!["10.89.3.0/24", "fd00:3::/64"],
+                IsolateOption::Normal,
+                false,
+            ),
+            net("open", vec!["10.89.4.0/24"], IsolateOption::Never, false),
+            net("int", vec!["10.89.5.0/24"], IsolateOption::Strict, true),
+        ];
+
+        assert_eq!(
+            network_rules(&all[0], &all, "re0"),
+            "table <isolated> { 10.89.2.0/24, 10.89.3.0/24, 10.89.4.0/24, 10.89.5.0/24, fd00:3::/64 }\n\
+             nat on re0 inet from 10.89.1.0/24 to any -> (re0)\n\
+             nat on re0 inet6 from fd00:1::/64 to !ff00::/8 -> (re0)\n\
+             pass in quick on br_strict_a inet from 10.89.1.0/24 to 10.89.1.0/24\n\
+             pass in quick on br_strict_a inet from 10.89.1.0/24 to (self)\n\
+             block in quick on br_strict_a inet from 10.89.1.0/24 to <isolated>\n\
+             pass in quick on br_strict_a inet6 from fd00:1::/64 to fd00:1::/64\n\
+             pass in quick on br_strict_a inet6 from fd00:1::/64 to (self)\n\
+             block in quick on br_strict_a inet6 from fd00:1::/64 to <isolated>\n"
+        );
+
+        let normal_rules = network_rules(&all[2], &all, "re0");
+        assert!(
+            normal_rules.starts_with(
+                "table <isolated> { 10.89.1.0/24, 10.89.2.0/24, 10.89.5.0/24, fd00:1::/64 }\n"
+            ),
+            "unexpected normal rules:\n{normal_rules}"
+        );
+        assert!(
+            !normal_rules.contains("10.89.4.0/24"),
+            "normal must not block non-isolated peer:\n{normal_rules}"
+        );
+
+        assert!(!peer_needs_reload(&all[2], &all[3]));
+        assert!(peer_needs_reload(&all[0], &all[3]));
+        assert!(peer_needs_reload(&all[2], &all[1]));
+        assert!(!peer_needs_reload(&all[3], &all[0]));
+        assert!(!peer_needs_reload(&all[4], &all[0]));
     }
 
     #[test]

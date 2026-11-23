@@ -1,6 +1,6 @@
 use std::{
-    fs::{self, File, OpenOptions},
-    io::{self, ErrorKind, Write},
+    fs::{self, File},
+    io::{self, Write},
     path::{Path, PathBuf},
 };
 
@@ -22,6 +22,8 @@ use crate::{
 const FIREWALL_DIR: &str = "firewall";
 const FIREWALL_DRIVER_FILE: &str = "firewall-driver";
 const FIREWALL_LOCK_FILE: &str = "firewall-reload.lock";
+#[cfg(target_os = "freebsd")]
+const PF_LOCK_FILE: &str = "pf.lock";
 const NETWORK_CONF_DIR: &str = "networks";
 const PORT_CONF_DIR: &str = "ports";
 
@@ -142,21 +144,26 @@ pub fn write_fw_config(
     .write_all(fw_driver.as_bytes())
     .map_err(|err| NetavarkError::wrap("failed to write firewall-driver file", err.into()))?;
 
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&paths.net_conf_file)
-    {
-        Ok(f) => serde_json::to_writer(f, &net_conf)?,
-        // net config file already exists no need to write the same stuff again.
-        Err(ref e) if e.kind() == ErrorKind::AlreadyExists => (),
-        Err(e) => {
-            return Err(NetavarkError::wrap(
-                format!("create network config {:?}", paths.net_conf_file.display()),
-                e.into(),
-            ));
-        }
-    };
+    if !paths.net_conf_file.exists() {
+        let json = serde_json::to_vec(&net_conf)?;
+        let tmp = paths
+            .net_conf_file
+            .with_file_name(format!(".{network_id}.tmp"));
+        fs_err!(File::create, &tmp, "create network config")?
+            .write_all(&json)
+            .map_err(|err| {
+                NetavarkError::wrap(
+                    format!("write network config {:?}", tmp.display()),
+                    err.into(),
+                )
+            })?;
+        fs::rename(&tmp, &paths.net_conf_file).map_err(|err| {
+            NetavarkError::wrap(
+                format!("rename network config {:?}", paths.net_conf_file.display()),
+                err.into(),
+            )
+        })?;
+    }
 
     let ports_file = fs_err!(File::create, &paths.port_conf_file, "create port config")?;
     serde_json::to_writer(ports_file, &port_conf)?;
@@ -227,10 +234,52 @@ pub fn read_fw_config(config_dir: &Path) -> NetavarkResult<Option<FirewallConfig
     }))
 }
 
+/// Serialize PF anchor and peer-table updates across concurrent Netavark
+/// processes. Acquire strictly inside (never outside) `firewall-reload.lock`.
+#[cfg(target_os = "freebsd")]
+pub fn lock_pf(config_dir: &Path) -> NetavarkResult<File> {
+    let dir = firewall_config_dir(config_dir);
+    fs_err!(fs::create_dir_all, &dir, "create firewall config dir")?;
+    let lock_path = dir.join(PF_LOCK_FILE);
+    let lock_file = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|err| {
+            NetavarkError::wrap(
+                format!("open pf lock file {:?}", lock_path.display()),
+                err.into(),
+            )
+        })?;
+    wrap!(lock_file.lock_exclusive(), "lock pf lock file")?;
+    Ok(lock_file)
+}
+
+/// Read all stored network firewall configs without acquiring the reload lock,
+/// so firewall drivers can inspect peer networks during `setup`, `teardown`,
+/// and `firewall-reload` (which already holds the lock).
+#[cfg(target_os = "freebsd")]
+pub fn read_network_configs(config_dir: &Path) -> NetavarkResult<Vec<SetupNetwork>> {
+    let dir = firewall_config_dir(config_dir).join(NETWORK_CONF_DIR);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    read_dir_conf(dir)
+}
+
 fn read_dir_conf<T: DeserializeOwned>(dir: PathBuf) -> NetavarkResult<Vec<T>> {
     let mut confs = Vec::new();
     for entry in fs_err!(fs::read_dir, &dir, "read dir")? {
         let path = ignore_enoent!(entry, continue)?.path();
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with('.'))
+        {
+            continue;
+        }
 
         let content = wrap!(
             ignore_enoent!(fs::read_to_string(&path), continue),
@@ -257,7 +306,7 @@ pub fn enable_container_port_snat(
     let paths = get_file_paths(config_dir, "", "", false)?;
     let entries = match fs::read_dir(&paths.port_conf_file) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => {
             return Err(NetavarkError::wrap(
                 format!("read dir {:?}", paths.port_conf_file.display()),
@@ -434,8 +483,31 @@ mod tests {
         };
 
         write_fw_config(config_dir, "net1", "cid1", "pf", &net_conf, &port_conf).unwrap();
+        // Hidden staging files must be ignored by dir scans.
+        fs::write(
+            config_dir.join("firewall/networks/.staging.tmp"),
+            b"not-valid-json",
+        )
+        .unwrap();
         let res = read_fw_config(config_dir).unwrap().unwrap();
         assert_eq!(res.port_confs.len(), 1);
         assert!(res.port_confs[0].snat_all);
+        #[cfg(target_os = "freebsd")]
+        {
+            // Must succeed while read_fw_config holds the exclusive lock.
+            assert_eq!(read_network_configs(config_dir).unwrap(), res.net_confs);
+            let empty = Builder::new().prefix("netavark-empty").tempdir().unwrap();
+            assert!(read_network_configs(empty.path()).unwrap().is_empty());
+
+            // Must acquire pf.lock inside firewall-reload.lock without deadlocking,
+            // and exclude a concurrent pf.lock holder until dropped.
+            let pf_guard = lock_pf(config_dir).unwrap();
+            let second = File::open(config_dir.join("firewall").join(PF_LOCK_FILE)).unwrap();
+            assert!(second.try_lock_exclusive().is_err());
+            drop(pf_guard);
+            assert!(second.try_lock_exclusive().is_ok());
+            let _ = second.unlock();
+        }
+        assert_eq!(res.net_confs, vec![net_conf]);
     }
 }

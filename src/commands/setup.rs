@@ -50,8 +50,10 @@ impl Setup {
         }
         debug!("Setting up...");
         let network_options = network::types::NetworkOptions::load(input_file)?;
+        let config_dir = get_config_dir(config_dir, "setup")?;
 
-        let firewall_driver = firewall::get_supported_firewall_driver(firewall_driver)?;
+        let firewall_driver =
+            firewall::get_supported_firewall_driver(firewall_driver, Path::new(&config_dir))?;
 
         let mut response: HashMap<String, types::StatusBlock> = HashMap::new();
 
@@ -75,7 +77,6 @@ impl Setup {
             netns.netlink.set_up(LinkID::ID(lo.header.index))?;
         }
 
-        let config_dir = get_config_dir(config_dir, "setup")?;
         let existing_ifaces = netns
             .netlink
             .dump_links(&mut Vec::new())

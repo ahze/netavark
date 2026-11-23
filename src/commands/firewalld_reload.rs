@@ -60,7 +60,7 @@ fn reload_rules_inner(config_dir: &Path, conn: &Option<Connection>) -> NetavarkR
     let conf = read_fw_config(config_dir).wrap("read firewall config")?;
     // If we got no conf there are no containers so nothing to do.
     if let Some(conf) = conf {
-        let fw_driver = get_supported_firewall_driver(Some(conf.driver))?;
+        let fw_driver = get_supported_firewall_driver(Some(conf.driver), config_dir)?;
 
         for net in conf.net_confs {
             fw_driver.setup_network(net, conn)?;

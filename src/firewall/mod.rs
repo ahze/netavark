@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use crate::error::{NetavarkError, NetavarkResult};
 use crate::network::internal_types::{
     PortForwardConfig, SetupNetwork, TearDownNetwork, TeardownPortForward,
@@ -141,7 +143,10 @@ fn get_default_fw_impl() -> NetavarkResult<FirewallImpl> {
 /// configuration.
 pub fn get_supported_firewall_driver(
     driver_name: Option<String>,
+    config_dir: &Path,
 ) -> NetavarkResult<Box<dyn FirewallDriver>> {
+    #[cfg(not(target_os = "freebsd"))]
+    let _ = config_dir;
     match get_firewall_impl(driver_name) {
         Ok(fw) => match fw {
             #[cfg(target_os = "linux")]
@@ -157,7 +162,7 @@ pub fn get_supported_firewall_driver(
             #[cfg(target_os = "freebsd")]
             FirewallImpl::Pf => {
                 info!("Using pf firewall driver");
-                pf::new()
+                pf::new(config_dir.to_path_buf())
             }
             FirewallImpl::Fwnone => {
                 info!("Not using firewall");

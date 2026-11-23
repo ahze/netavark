@@ -90,7 +90,8 @@ impl Teardown {
             }
         }
 
-        let firewall_driver = firewall::get_supported_firewall_driver(firewall_driver)?;
+        let firewall_driver =
+            firewall::get_supported_firewall_driver(firewall_driver, Path::new(&config_dir))?;
 
         let mut hostns = core_utils::open_host_netlink_socket()?;
         let (netns_file, mut netns_netlink) =
